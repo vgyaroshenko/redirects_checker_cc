@@ -4,4 +4,4 @@ source .venv/bin/activate
 Встанови залежності:
 pip install requests openpyxl
 Запусти:
-python check_redirects.py ./ccw-1393.csv bad_redirects.csv
+python check_redirects.py redirects.csv bad_redirects.csv --timeout 15 --workers 10
