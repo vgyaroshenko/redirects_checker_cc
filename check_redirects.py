@@ -16,7 +16,7 @@ adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
 SESSION.mount("http://", adapter)
 SESSION.mount("https://", adapter)
 
-# Лок для синхронного друку прогресу
+# Лок і змінні для прогресу
 print_lock = threading.Lock()
 progress_counter = 0
 total_tasks = 0
@@ -28,8 +28,18 @@ def print_progress(msg: str):
         print(msg)
 
 
+def update_progress():
+    """Оновлює лічильник прогресу та друкує кожні 10 елементів."""
+    global progress_counter, total_tasks
+    with print_lock:
+        progress_counter += 1
+        pct = (progress_counter / total_tasks) * 100 if total_tasks else 0
+        if progress_counter % 10 == 0 or progress_counter == total_tasks:
+            print(f"Перевірено {progress_counter} / {total_tasks} ({pct:.1f}%)")
+
+
 def build_full_url(path: str, base: str) -> str:
-    """Формує повний URL."""
+    """Формує повний URL із шляху або повертає як є, якщо це вже URL."""
     path = path.strip()
     if not path:
         return path
@@ -75,11 +85,12 @@ def read_redirects(input_path: str):
 
 
 def normalize_url(url: str) -> str:
+    """Нормалізація URL для порівняння."""
     return url.strip().rstrip("/")
 
 
 def _request_with_fallback(url: str, timeout: int):
-    """HEAD → fallback → GET"""
+    """HEAD → (за потреби) GET."""
     try:
         resp = SESSION.head(url, allow_redirects=True, timeout=timeout)
         if resp.status_code in (405, 501) and not resp.history:
@@ -90,9 +101,7 @@ def _request_with_fallback(url: str, timeout: int):
 
 
 def check_one_redirect(item: dict, timeout: int = 10) -> dict:
-    """Основна логіка перевірки."""
-    global progress_counter, total_tasks
-
+    """Основна логіка перевірки одного редіректу."""
     source = item["Source"]
     target = item["Target"]
     expected_code = item["ExpectedCode"]
@@ -107,11 +116,23 @@ def check_one_redirect(item: dict, timeout: int = 10) -> dict:
         "Error": "",
     }
 
+    # 🔍 1. Перевірка: Source і Target однакові
+    if normalize_url(source) == normalize_url(target):
+        result["Error"] = (
+            "Source і Target однакові. Налаштований редірект на ту саму URL "
+            "(ймовірно, спроба редіректу 404 на саму сторінку)."
+        )
+        print_progress(f"[ERROR same-url] {source}")
+        update_progress()
+        return result
+
+    # 🔍 2. HTTP-запит із обробкою помилок
     try:
         response = _request_with_fallback(source, timeout)
     except requests.Timeout:
         result["Error"] = f"Таймаут після {timeout} секунд"
         print_progress(f"[ERROR timeout] {source}")
+        update_progress()
         return result
     except requests.TooManyRedirects as e:
         history = getattr(e, "history", []) or []
@@ -131,17 +152,20 @@ def check_one_redirect(item: dict, timeout: int = 10) -> dict:
 
         result["Error"] = f"Перевищено ліміт редіректів (30). {cycle_info}"
         print_progress(f"[ERROR redirect loop] {source}")
+        update_progress()
         return result
     except requests.ConnectionError:
         result["Error"] = "Помилка з'єднання"
         print_progress(f"[ERROR connection] {source}")
+        update_progress()
         return result
     except requests.RequestException as e:
         result["Error"] = f"HTTP-помилка: {type(e).__name__}"
         print_progress(f"[ERROR {type(e).__name__}] {source}")
+        update_progress()
         return result
 
-    # Успішно
+    # 🔍 3. Успішний запит — аналіз коду та фінального URL
     first_response = response.history[0] if response.history else response
     result["FirstStatus"] = first_response.status_code
     result["FinalUrl"] = response.url
@@ -151,7 +175,7 @@ def check_one_redirect(item: dict, timeout: int = 10) -> dict:
 
     result["Ok"] = status_ok and url_ok
 
-    # Вивід статус-коду в термінал
+    # Лог у консоль
     if response.history:
         print_progress(f"[{first_response.status_code}] {source} → {response.url}")
     else:
@@ -163,25 +187,27 @@ def check_one_redirect(item: dict, timeout: int = 10) -> dict:
     if not url_ok:
         result["Error"] += f"Очікуваний фінальний URL {target}, отримано {response.url}."
 
-    # Прогрес
-    with print_lock:
-        progress_counter += 1
-        pct = (progress_counter / total_tasks) * 100
-        if progress_counter % 10 == 0 or progress_counter == total_tasks:
-            print(f"Перевірено {progress_counter} / {total_tasks} ({pct:.1f}%)")
-
+    update_progress()
     return result
 
 
 def write_failed_redirects(results: list[dict], output_path: str):
+    """Записує у CSV тільки ті редіректи, які не Ok."""
     failed = [r for r in results if not r["Ok"]]
 
     if not failed:
         print("Усі редіректи коректні. Файл з помилками не створено.")
         return
 
-    fieldnames = ["Source", "Target", "ExpectedCode",
-                  "FirstStatus", "FinalUrl", "Ok", "Error"]
+    fieldnames = [
+        "Source",
+        "Target",
+        "ExpectedCode",
+        "FirstStatus",
+        "FinalUrl",
+        "Ok",
+        "Error",
+    ]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -196,10 +222,10 @@ def main():
     global total_tasks
 
     parser = argparse.ArgumentParser(description="Перевірка редіректів")
-    parser.add_argument("input", help="CSV без заголовків")
+    parser.add_argument("input", help="CSV без заголовків (Source, Target, Code)")
     parser.add_argument("output", help="CSV з помилками")
-    parser.add_argument("--workers", type=int, default=40)
-    parser.add_argument("--timeout", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=40, help="Кількість потоків")
+    parser.add_argument("--timeout", type=int, default=8, help="Таймаут HTTP-запитів")
 
     args = parser.parse_args()
 
